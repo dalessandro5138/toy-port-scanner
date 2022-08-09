@@ -1,26 +1,32 @@
 use std::net::{SocketAddr, TcpStream};
-use std::thread::{JoinHandle, Result};
-// use std::result::Result;
 use std::{io::Result as IOResult, thread, time::Duration};
-// use std::any::Any
 
-// type Res<T> = Result<T, Box<dyn Any + Send + 'static>>;
+mod iter_chunker;
+use iter_chunker::ChunkExt;
+
 type Res<T> = IOResult<T>;
+
+const MIN_PORT: u16 = u16::MIN;
+const MAX_PORT: u16 = u16::MAX;
 
 pub struct PortScanner {
     timeout: Duration,
-    pub sc: SocketConnector,
 }
 
 impl PortScanner {
-    pub fn new(timeout: Duration, sc: SocketConnector) -> Self {
-        Self { timeout, sc }
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
     }
-}
 
-pub enum ExecutionContext {
-    Parallel(u8),
-    Sequential,
+    pub fn scan(&self, ip: [u8; 4]) -> Vec<IOResult<TcpStream>> {
+        (MIN_PORT..MAX_PORT)
+            .map(|port| SocketAddr::from((ip, port)))
+            .chunk(2000)
+            .into_iter()
+            .flat_map(|socks| self.connect_batch(socks))
+            .filter(|result| result.is_ok())
+            .collect::<Vec<IOResult<TcpStream>>>()
+    }
 }
 
 pub trait Execute {
@@ -31,45 +37,27 @@ pub trait Execute {
         F: Send + 'static;
 }
 
-impl Execute for ExecutionContext {
+impl Execute for PortScanner {
     fn execute_all<F, T>(&self, f: Vec<F>) -> Vec<Res<T>>
     where
         F: FnOnce() -> T,
         T: Send + 'static,
         F: Send + 'static,
     {
-        match self {
-            ExecutionContext::Parallel(b) => {
-                let a: Vec<_> = f
-                    .into_iter()
-                    .map(|fun| thread::spawn(move || fun()))
-                    .collect();
+        let a: Vec<_> = f
+            .into_iter()
+            .map(|fun| thread::spawn(move || fun()))
+            .collect();
 
-                a.into_iter()
-                    .map(|h| h.join().map_err(|e| std::panic::resume_unwind(Box::new(e))))
-                    .collect::<Vec<Res<T>>>()
-            }
-            ExecutionContext::Sequential => todo!(),
-        }
+        a.into_iter()
+            .map(|h| h.join().map_err(|e| std::panic::resume_unwind(Box::new(e))))
+            .collect::<Vec<Res<T>>>()
     }
 }
 
-pub struct SocketConnector {
-    ec: ExecutionContext,
-}
-
-impl SocketConnector {
-    pub fn new(ec: ExecutionContext) -> Self {
-        Self { ec }
-    }
-}
 pub trait Connect {
     fn connect_batch(&self, socks: Vec<SocketAddr>) -> Vec<Res<TcpStream>>;
 }
-
-// pub trait ParContext: ExecutionContext {
-//     fn execute<T>(&self, f: impl FnOnce() -> T) -> JoinHandle<T>;
-// }
 
 impl Connect for PortScanner {
     fn connect_batch(&self, socks: Vec<SocketAddr>) -> Vec<Res<TcpStream>> {
@@ -79,9 +67,7 @@ impl Connect for PortScanner {
             .map(|sock| move || TcpStream::connect_timeout(&sock, t))
             .collect();
 
-        self.sc
-            .ec
-            .execute_all(handles)
+        self.execute_all(handles)
             .into_iter()
             .flat_map(|a| a.map_err(|e| std::panic::resume_unwind(Box::new(e))))
             .collect::<Vec<Res<TcpStream>>>()
